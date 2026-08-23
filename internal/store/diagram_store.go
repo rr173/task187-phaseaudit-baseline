@@ -16,6 +16,9 @@ type DiagramStore struct{ db *DB }
 func NewDiagramStore(db *DB) *DiagramStore { return &DiagramStore{db: db} }
 
 // Create 插入相图版本（同名版本号自动递增）。
+//
+// 调用方需自行保证传入的 VersionNo 是在事务内计算得到的，否则并发下会撞
+// UNIQUE(name,version_no)。新代码应直接使用 CreateAtomically。
 func (s *DiagramStore) Create(d *model.PhaseDiagram) (*model.PhaseDiagram, error) {
 	phasesJSON, err := json.Marshal(d.Phases)
 	if err != nil {
@@ -39,7 +42,56 @@ func (s *DiagramStore) Create(d *model.PhaseDiagram) (*model.PhaseDiagram, error
 	return d, nil
 }
 
+// CreateAtomically 在单个事务内完成「计算下一版本号 + 插入」，使并发同名创建
+// 被串行化（事务在 SetMaxOpenConns(1) 下独占唯一连接），从而得到唯一且连续的
+// 版本号。不同相图名称经 WHERE name=? 独立筛选，版本序列互不影响。
+func (s *DiagramStore) CreateAtomically(name string, phases []model.PhaseDef, summary string) (*model.PhaseDiagram, error) {
+	tx, err := s.db.SQL().Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var maxV int
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(version_no),0) FROM phase_diagrams WHERE name=?`, name).Scan(&maxV); err != nil {
+		return nil, fmt.Errorf("compute next version: %w", err)
+	}
+	ver := maxV + 1
+
+	phasesJSON, err := json.Marshal(phases)
+	if err != nil {
+		return nil, fmt.Errorf("marshal phases: %w", err)
+	}
+	now := Now()
+	res, err := tx.Exec(
+		`INSERT INTO phase_diagrams(name, version_no, status, phases, summary, created_at)
+		 VALUES (?,?,?,?,?,?)`,
+		name, ver, "draft", string(phasesJSON), summary, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert phase diagram: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit diagram: %w", err)
+	}
+	return &model.PhaseDiagram{
+		ID:        id,
+		Name:      name,
+		VersionNo: ver,
+		Status:    "draft",
+		Phases:    phases,
+		Summary:   summary,
+		CreatedAt:  now,
+	}, nil
+}
+
 // NextVersionNo 计算同一名称相图的下一个版本号。
+//
+// 注意：单独调用非并发安全，仅用于读取展示；版本分配请使用 CreateAtomically。
 func (s *DiagramStore) NextVersionNo(name string) (int, error) {
 	var maxV int
 	err := s.db.SQL().QueryRow(`SELECT COALESCE(MAX(version_no),0) FROM phase_diagrams WHERE name=?`, name).Scan(&maxV)

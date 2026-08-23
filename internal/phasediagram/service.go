@@ -3,7 +3,6 @@ package phasediagram
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
 
 	"task187-phaseaudit/internal/model"
@@ -26,6 +25,12 @@ type CreateInput struct {
 }
 
 // Create 创建新相图版本（同名版本号自动递增，初始为 draft）。
+//
+// 版本号分配与插入必须在同一事务内原子完成，否则并发请求会在各自
+// SELECT MAX 与 INSERT 之间交错，读到同一个版本号进而撞 UNIQUE(name,version_no)
+// 或产生重复/空洞版本号。事务在 SetMaxOpenConns(1) 下独占唯一连接，
+// 同名创建因此被串行化：每个事务看到已提交的最新 MAX，得到唯一且连续的版本号；
+// 不同相图名称因 WHERE name=? 独立筛选，版本序列互不影响。
 func (s *Service) Create(in CreateInput) (*model.PhaseDiagram, error) {
 	if strings.TrimSpace(in.Name) == "" {
 		return nil, fmt.Errorf("相图名称不能为空")
@@ -49,19 +54,7 @@ func (s *Service) Create(in CreateInput) (*model.PhaseDiagram, error) {
 			return nil, fmt.Errorf("相 %s 典型比例必须在 0-1 之间", p.Phase)
 		}
 	}
-	ver, err := s.store.NextVersionNo(in.Name)
-	if err != nil {
-		return nil, err
-	}
-	runtime.Gosched()
-	d := &model.PhaseDiagram{
-		Name:      in.Name,
-		VersionNo: ver,
-		Status:    "draft",
-		Phases:    in.Phases,
-		Summary:   in.Summary,
-	}
-	return s.store.Create(d)
+	return s.store.CreateAtomically(in.Name, in.Phases, in.Summary)
 }
 
 // Get 查询相图。
