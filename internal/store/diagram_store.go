@@ -1,0 +1,126 @@
+package store
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"task187-phaseaudit/internal/model"
+)
+
+// DiagramStore 相图版本的持久化读写。
+type DiagramStore struct{ db *DB }
+
+// NewDiagramStore 构造 DiagramStore。
+func NewDiagramStore(db *DB) *DiagramStore { return &DiagramStore{db: db} }
+
+// Create 插入相图版本（同名版本号自动递增）。
+func (s *DiagramStore) Create(d *model.PhaseDiagram) (*model.PhaseDiagram, error) {
+	phasesJSON, err := json.Marshal(d.Phases)
+	if err != nil {
+		return nil, fmt.Errorf("marshal phases: %w", err)
+	}
+	now := Now()
+	res, err := s.db.SQL().Exec(
+		`INSERT INTO phase_diagrams(name, version_no, status, phases, summary, created_at)
+		 VALUES (?,?,?,?,?,?)`,
+		d.Name, d.VersionNo, d.Status, string(phasesJSON), d.Summary, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert phase diagram: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	d.ID = id
+	d.CreatedAt = now
+	return d, nil
+}
+
+// NextVersionNo 计算同一名称相图的下一个版本号。
+func (s *DiagramStore) NextVersionNo(name string) (int, error) {
+	var maxV int
+	err := s.db.SQL().QueryRow(`SELECT COALESCE(MAX(version_no),0) FROM phase_diagrams WHERE name=?`, name).Scan(&maxV)
+	return maxV + 1, err
+}
+
+// Get 按 ID 查询相图版本。
+func (s *DiagramStore) Get(id int64) (*model.PhaseDiagram, error) {
+	row := s.db.SQL().QueryRow(
+		`SELECT id,name,version_no,status,phases,summary,created_at,COALESCE(published_at,'')
+		 FROM phase_diagrams WHERE id=?`, id)
+	return scanDiagram(row)
+}
+
+// List 列出全部相图版本（按 ID 倒序）。
+func (s *DiagramStore) List() ([]*model.PhaseDiagram, error) {
+	rows, err := s.db.SQL().Query(
+		`SELECT id,name,version_no,status,phases,summary,created_at,COALESCE(published_at,'')
+		 FROM phase_diagrams ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.PhaseDiagram
+	for rows.Next() {
+		d, err := scanDiagram(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// LatestPublished 返回最近一次已发布版本（用于推断）。
+func (s *DiagramStore) LatestPublished() (*model.PhaseDiagram, error) {
+	row := s.db.SQL().QueryRow(
+		`SELECT id,name,version_no,status,phases,summary,created_at,COALESCE(published_at,'')
+		 FROM phase_diagrams WHERE status='published' ORDER BY id DESC LIMIT 1`)
+	return scanDiagram(row)
+}
+
+// Publish 发布相图版本。
+func (s *DiagramStore) Publish(id int64) (*model.PhaseDiagram, error) {
+	now := Now()
+	res, err := s.db.SQL().Exec(
+		`UPDATE phase_diagrams SET status='published', published_at=? WHERE id=? AND status='draft'`, now, id)
+	if err != nil {
+		return nil, fmt.Errorf("publish diagram: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// 可能已发布或不存在，回读判断。
+		d, gerr := s.Get(id)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if d.Status == "published" {
+			return d, nil
+		}
+		return nil, model.ErrInvalidState
+	}
+	return s.Get(id)
+}
+
+type diagramScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanDiagram(row diagramScanner) (*model.PhaseDiagram, error) {
+	var d model.PhaseDiagram
+	var phasesJSON string
+	if err := row.Scan(&d.ID, &d.Name, &d.VersionNo, &d.Status, &phasesJSON, &d.Summary,
+		&d.CreatedAt, &d.PublishedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, model.ErrNotFound
+		}
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(phasesJSON), &d.Phases); err != nil {
+		return nil, fmt.Errorf("unmarshal phases: %w", err)
+	}
+	return &d, nil
+}
