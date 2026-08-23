@@ -5,7 +5,7 @@
 - 项目：材料显微组织相鉴定证据复核台（`task187-phaseaudit`）
 - 需求：`REQ-20260823-050`
 - 模块：`task187-phaseaudit`，Go 1.26.3 + SQLite（`modernc.org/sqlite`）
-- 代码基线：`env/`（Git 根，canonical `main` 提交）
+- 代码基线：`env/`（源码仓库根目录）
 
 ## 构建与门禁
 
