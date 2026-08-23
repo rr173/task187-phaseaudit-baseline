@@ -89,12 +89,22 @@ func (s *BatchStore) List(limit, offset int) ([]*model.MaterialBatch, error) {
 	return out, rows.Err()
 }
 
-// UpdateStatus 更新批次状态（原子单行更新）。
+// UpdateStatus 更新批次状态（落盘传入的 status，不再硬编码）。
 func (s *BatchStore) UpdateStatus(id int64, status string) error {
-	_, err := s.db.SQL().Exec(
-		`UPDATE material_batches SET status=?, updated_at=? WHERE id=?`, model.BatchPendingReview, Now(), id)
+	return s.UpdateStatusTx(s.db.SQL(), id, status)
+}
+
+// UpdateStatusTx 在指定执行器（*sql.DB 或事务内 *sql.Tx）上更新批次状态，
+// 供跨表原子写复用：仲裁拒绝需在同一事务中与候选状态一并落盘。
+func (s *BatchStore) UpdateStatusTx(tx DBTX, id int64, status string) error {
+	res, err := tx.Exec(
+		`UPDATE material_batches SET status=?, updated_at=? WHERE id=?`, status, Now(), id)
 	if err != nil {
 		return fmt.Errorf("update batch status: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return model.ErrNotFound
 	}
 	return nil
 }

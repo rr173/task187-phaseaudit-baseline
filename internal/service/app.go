@@ -37,7 +37,7 @@ func New(db *store.DB) (*App, error) {
 	batchSvc := batch.New(batchStore, obsStore)
 	obsSvc := observation.New(obsStore, batchStore)
 	infSvc := inference.New(diagStore, candStore, obsStore, diagSvc)
-	arbSvc := arbitration.New(arbStore, candStore, batchStore)
+	arbSvc := arbitration.New(db, arbStore, candStore, batchStore)
 	repSvc := report.New(repStore, batchStore, candStore, obsStore, diagStore)
 
 	return &App{

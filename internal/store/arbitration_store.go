@@ -74,7 +74,13 @@ func (s *ArbitrationStore) HasOpenForCandidate(candidateID int64) (bool, error) 
 
 // Decide 裁决：关闭仲裁并写入决定。
 func (s *ArbitrationStore) Decide(id int64, decision, note string) error {
-	res, err := s.db.SQL().Exec(
+	return s.DecideTx(s.db.SQL(), id, decision, note)
+}
+
+// DecideTx 在指定执行器（*sql.DB 或事务内 *sql.Tx）上关闭仲裁并写入决定，
+// 供跨表原子写复用：仲裁决定需与候选/批次状态流转在同一事务中提交。
+func (s *ArbitrationStore) DecideTx(tx DBTX, id int64, decision, note string) error {
+	res, err := tx.Exec(
 		`UPDATE arbitrations SET status=?, decision=?, note=?, decided_at=? WHERE id=? AND status=?`,
 		model.ArbDecided, decision, note, Now(), id, model.ArbOpen)
 	if err != nil {

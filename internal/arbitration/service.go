@@ -11,20 +11,21 @@ import (
 
 // Kind 常量：仲裁触发类型。
 const (
-	KindObservationConflict = "observation_conflict" // 观察者分歧
-	KindConservationFailure = "conservation_failure" // 成分守恒失败
+	KindObservationConflict  = "observation_conflict"  // 观察者分歧
+	KindConservationFailure  = "conservation_failure"  // 成分守恒失败
 )
 
 // Service 仲裁模块服务。
 type Service struct {
+	db    *store.DB
 	store *store.ArbitrationStore
 	cands *store.CandidateStore
 	batch *store.BatchStore
 }
 
 // New 构造仲裁服务。
-func New(store *store.ArbitrationStore, cands *store.CandidateStore, batch *store.BatchStore) *Service {
-	return &Service{store: store, cands: cands, batch: batch}
+func New(db *store.DB, store *store.ArbitrationStore, cands *store.CandidateStore, batch *store.BatchStore) *Service {
+	return &Service{db: db, store: store, cands: cands, batch: batch}
 }
 
 // OpenInput 创建仲裁入参。
@@ -73,10 +74,13 @@ type DecideInput struct {
 	NewFraction *float64 `json:"new_fraction,omitempty"` // downscale 时的新比例
 }
 
-// Decide 执行仲裁决定并驱动状态流转：
-//   - confirm  → 候选 confirmed，批次 → composition_fixed（若比例和 ≤ 1）；
-//   - downscale → 候选按新比例重写并置 acceptable（需守恒重检），批次 → pending_review；
-//   - reject   → 候选 rejected。
+// Decide 执行仲裁决定并驱动状态流转，全部在同一事务内提交：
+//   - confirm  → 候选 confirmed；批次推进由调用方显式流转（可能有多候选需一并确认）。
+//   - downscale → 候选按新比例重写并置 acceptable，批次 → pending_review。
+//   - reject   → 候选 rejected 且批次 → insufficient，二者在同一事务落盘，
+//     任意一步失败整体回滚，避免接口返回后状态停留在仲裁/待复核。
+//
+// 状态流转与仲裁关闭写入同一事务，保证决定生效与状态推进原子一致。
 func (s *Service) Decide(arbID int64, in DecideInput) (*model.Arbitration, error) {
 	a, err := s.store.Get(arbID)
 	if err != nil {
@@ -90,13 +94,10 @@ func (s *Service) Decide(arbID int64, in DecideInput) (*model.Arbitration, error
 		return nil, err
 	}
 
+	// 预校验（不落盘）：在进入事务前拒绝非法入参，避免无谓地开启并回滚事务。
 	switch in.Decision {
 	case model.DecisionConfirm:
-		if err := s.cands.Confirm(c.ID); err != nil {
-			return nil, err
-		}
-		// 批次推进由调用方显式流转（MoveToReview → ConfirmComposition），
-		// 因为可能还有其它候选需要一并确认。
+		// 无额外入参约束。
 	case model.DecisionDownscale:
 		if in.NewFraction == nil {
 			return nil, fmt.Errorf("下调决定必须提供新比例")
@@ -105,36 +106,48 @@ func (s *Service) Decide(arbID int64, in DecideInput) (*model.Arbitration, error
 		if nf < 0 || nf > 1 {
 			return nil, fmt.Errorf("%w: 新比例 %v", model.ErrNegativeFraction, nf)
 		}
-		// 重写比例：直接更新 fraction 字段（经 upsert 落盘）。
-		if err := s.rewriteFraction(c, nf); err != nil {
-			return nil, err
-		}
-		if err := s.cands.UpdateStatus(c.ID, model.CandAcceptable); err != nil {
-			return nil, err
-		}
-		if err := s.batch.UpdateStatus(a.BatchID, model.BatchPendingReview); err != nil {
-			return nil, err
-		}
 	case model.DecisionReject:
-		if err := s.cands.UpdateStatus(c.ID, model.CandArbitration); err != nil {
-			return nil, err
-		}
-		if err := s.batch.UpdateStatus(a.BatchID, model.BatchInsufficient); err != nil {
-			return nil, err
-		}
+		// 拒绝：候选 → rejected、批次 → insufficient，二者必须一起落盘。
 	default:
 		return nil, fmt.Errorf("未知仲裁决定 %q", in.Decision)
 	}
 
-	if err := s.store.Decide(arbID, in.Decision, in.Note); err != nil {
+	// 事务内驱动状态流转并关闭仲裁，任一步失败整体回滚。
+	if err := s.db.InTransaction(func(tx store.DBTX) error {
+		switch in.Decision {
+		case model.DecisionConfirm:
+			if err := s.cands.ConfirmTx(tx, c.ID); err != nil {
+				return err
+			}
+		case model.DecisionDownscale:
+			nf := *in.NewFraction
+			if err := s.rewriteFractionTx(tx, c, nf); err != nil {
+				return err
+			}
+			if err := s.cands.UpdateStatusTx(tx, c.ID, model.CandAcceptable); err != nil {
+				return err
+			}
+			if err := s.batch.UpdateStatusTx(tx, a.BatchID, model.BatchPendingReview); err != nil {
+				return err
+			}
+		case model.DecisionReject:
+			if err := s.cands.UpdateStatusTx(tx, c.ID, model.CandRejected); err != nil {
+				return err
+			}
+			if err := s.batch.UpdateStatusTx(tx, a.BatchID, model.BatchInsufficient); err != nil {
+				return err
+			}
+		}
+		// 关闭仲裁并写入决定，与状态流转同一事务提交。
+		return s.store.DecideTx(tx, arbID, in.Decision, in.Note)
+	}); err != nil {
 		return nil, err
 	}
 	return s.store.Get(arbID)
 }
 
-// rewriteFraction 重写候选比例（fraction/区间），供下调使用。
-func (s *Service) rewriteFraction(c *model.PhaseCandidate, frac float64) error {
-	// 通过 upsert 全量写回（同 batch+diagram+phase 冲突更新）。
+// rewriteFractionTx 在事务内重写候选比例，供下调决定在同一事务内落盘。
+func (s *Service) rewriteFractionTx(tx store.DBTX, c *model.PhaseCandidate, frac float64) error {
 	up := *c
 	up.Fraction = frac
 	up.FractionLow = frac * 0.8
@@ -142,7 +155,7 @@ func (s *Service) rewriteFraction(c *model.PhaseCandidate, frac float64) error {
 	if up.FractionHigh > 1 {
 		up.FractionHigh = 1
 	}
-	_, err := s.cands.Upsert(&up)
+	_, err := s.cands.UpsertTx(tx, &up)
 	return err
 }
 

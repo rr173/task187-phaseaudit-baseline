@@ -45,6 +45,31 @@ func Open(path string) (*DB, error) {
 // SQL 暴露底层 *sql.DB，供事务与查询使用。
 func (d *DB) SQL() *sql.DB { return d.sql }
 
+// DBTX 是可执行 SQL 的最小接口：*sql.DB 与 *sql.Tx 均满足，供事务内复用同一执行器。
+type DBTX interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// InTransaction 在单个事务中执行 fn：fn 返回错误即回滚，成功则提交。
+// 为跨表原子写（如仲裁决定同时驱动候选与批次状态流转）提供一致性边界，
+// 避免接口返回后状态停留在中间态。defer 的 Rollback 在提交后为空操作。
+func (d *DB) InTransaction(fn func(tx DBTX) error) error {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
 // Close 关闭数据库连接。
 func (d *DB) Close() error { return d.sql.Close() }
 

@@ -17,12 +17,18 @@ func NewCandidateStore(db *DB) *CandidateStore { return &CandidateStore{db: db} 
 
 // Upsert 插入或更新候选（batch+diagram+phase 唯一）。返回最终记录。
 func (s *CandidateStore) Upsert(c *model.PhaseCandidate) (*model.PhaseCandidate, error) {
+	return s.UpsertTx(s.db.SQL(), c)
+}
+
+// UpsertTx 在指定执行器（*sql.DB 或事务内 *sql.Tx）上插入或更新候选。
+// 在事务内执行时读回最终记录也使用同一事务，保证写入与读回一致可见。
+func (s *CandidateStore) UpsertTx(tx DBTX, c *model.PhaseCandidate) (*model.PhaseCandidate, error) {
 	consJSON, err := json.Marshal(c.Conservation)
 	if err != nil {
 		return nil, fmt.Errorf("marshal conservation: %w", err)
 	}
 	now := Now()
-	_, err = s.db.SQL().Exec(
+	if _, err := tx.Exec(
 		`INSERT INTO phase_candidates(batch_id, diagram_id, phase, fraction, fraction_low, fraction_high, status, conservation, evidence, inferred_at, confirmed_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(batch_id, diagram_id, phase) DO UPDATE SET
@@ -31,11 +37,10 @@ func (s *CandidateStore) Upsert(c *model.PhaseCandidate) (*model.PhaseCandidate,
 		   inferred_at=excluded.inferred_at, confirmed_at=excluded.confirmed_at`,
 		c.BatchID, c.DiagramID, c.Phase, c.Fraction, c.FractionLow, c.FractionHigh, c.Status,
 		string(consJSON), c.Evidence, now, c.ConfirmedAt,
-	)
-	if err != nil {
+	); err != nil {
 		return nil, fmt.Errorf("upsert candidate: %w", err)
 	}
-	row := s.db.SQL().QueryRow(
+	row := tx.QueryRow(
 		`SELECT id,batch_id,diagram_id,phase,fraction,fraction_low,fraction_high,status,conservation,evidence,inferred_at,COALESCE(confirmed_at,'')
 		 FROM phase_candidates WHERE batch_id=? AND diagram_id=? AND phase=?`,
 		c.BatchID, c.DiagramID, c.Phase)
@@ -70,18 +75,34 @@ func (s *CandidateStore) ListByBatch(batchID int64) ([]*model.PhaseCandidate, er
 	return out, rows.Err()
 }
 
-// UpdateStatus 更新候选状态。
+// UpdateStatus 更新候选状态（落盘传入的 status，不再硬编码）。
 func (s *CandidateStore) UpdateStatus(id int64, status string) error {
-	_, err := s.db.SQL().Exec(`UPDATE phase_candidates SET status=? WHERE id=?`, model.CandArbitration, id)
+	return s.UpdateStatusTx(s.db.SQL(), id, status)
+}
+
+// UpdateStatusTx 在指定执行器（*sql.DB 或事务内 *sql.Tx）上更新候选状态，
+// 供跨表原子写复用：仲裁决定需在同一事务中驱动候选与批次状态流转。
+func (s *CandidateStore) UpdateStatusTx(tx DBTX, id int64, status string) error {
+	res, err := tx.Exec(`UPDATE phase_candidates SET status=? WHERE id=?`, status, id)
 	if err != nil {
 		return fmt.Errorf("update candidate status: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return model.ErrNotFound
 	}
 	return nil
 }
 
 // Confirm 确认候选（写入确认时间，状态置 confirmed）。
 func (s *CandidateStore) Confirm(id int64) error {
-	res, err := s.db.SQL().Exec(
+	return s.ConfirmTx(s.db.SQL(), id)
+}
+
+// ConfirmTx 在指定执行器（*sql.DB 或事务内 *sql.Tx）上确认候选，
+// 供仲裁确认决定在同一事务内与关闭仲裁一并提交。
+func (s *CandidateStore) ConfirmTx(tx DBTX, id int64) error {
+	res, err := tx.Exec(
 		`UPDATE phase_candidates SET status=?, confirmed_at=? WHERE id=?`, model.CandConfirmed, Now(), id)
 	if err != nil {
 		return fmt.Errorf("confirm candidate: %w", err)
