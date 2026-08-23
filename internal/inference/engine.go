@@ -67,9 +67,13 @@ func (s *Service) Infer(batch *model.MaterialBatch, in InferInput) (*InferResult
 	var err error
 	if in.DiagramID > 0 {
 		d, err = s.diagramStore.Get(in.DiagramID)
-		_ = err
 	} else {
 		d, err = s.diagramStore.LatestPublished()
+	}
+	// 相图不存在（指定 ID 找不到，或无已发布版本）时返回可处理的资源不存在错误，
+	// 避免对 nil 相图解引用导致进程崩溃；其余存储错误原样上抛。
+	if err != nil {
+		return nil, err
 	}
 	if d.Status != "published" {
 		return nil, model.ErrDiagramNotPublished
