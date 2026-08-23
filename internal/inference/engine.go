@@ -212,6 +212,7 @@ func (s *Service) approxMassBalance(comp model.Composition, p model.PhaseDef, fr
 }
 
 // observerPrior 汇总批次内未排除观察者对某相的比例估计（百分比 → 0-1，取平均）。
+// 被复核者明确排除（excluded）或已被新观察取代（superseded）的观察不计入先验。
 func (s *Service) observerPrior(batchID int64) map[string]float64 {
 	obs, err := s.obsStore.ListByBatch(batchID)
 	if err != nil {
@@ -220,7 +221,7 @@ func (s *Service) observerPrior(batchID int64) map[string]float64 {
 	sum := map[string]float64{}
 	cnt := map[string]int{}
 	for _, o := range obs {
-		if o.Status == model.ObsSuperseded {
+		if o.Status == model.ObsExcluded || o.Status == model.ObsSuperseded {
 			continue
 		}
 		for phase, pct := range o.PhaseEstimate {
@@ -237,7 +238,7 @@ func (s *Service) observerPrior(batchID int64) map[string]float64 {
 	return out
 }
 
-// evidenceText 生成候选证据摘要：引用支持该相的观察者列表。
+// evidenceText 生成候选证据摘要：引用支持该相且未被排除的观察者列表。
 func (s *Service) evidenceText(batchID int64, phase string) string {
 	obs, err := s.obsStore.ListByBatch(batchID)
 	if err != nil {
@@ -245,7 +246,7 @@ func (s *Service) evidenceText(batchID int64, phase string) string {
 	}
 	var observers []string
 	for _, o := range obs {
-		if o.Status == model.ObsSuperseded {
+		if o.Status == model.ObsExcluded || o.Status == model.ObsSuperseded {
 			continue
 		}
 		if _, ok := o.PhaseEstimate[phase]; ok {
