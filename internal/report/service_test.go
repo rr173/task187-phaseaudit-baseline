@@ -1,6 +1,7 @@
 package report_test
 
 import (
+	"errors"
 	"testing"
 
 	"task187-phaseaudit/internal/batch"
@@ -74,6 +75,89 @@ func TestReviseSupersedesPublishedReportAndKeepsInputVersion(t *testing.T) {
 	}
 }
 
+// TestReviseRejectedWhenObservationsAddedAfterPublish 验证已发布报告绑定了发布时的观察证据版本：
+// 发布后新增观察会改变证据指纹集合，旧报告的修订应被拒绝并提示输入版本漂移，
+// 而非把新证据直接混入旧报告的修订流程。
+func TestReviseRejectedWhenObservationsAddedAfterPublish(t *testing.T) {
+	app := newReportAppWithConfirmedCandidate(t)
+	batchList, err := app.Batch.List(10, 0)
+	if err != nil || len(batchList) != 1 {
+		t.Fatalf("list batch: len=%d err=%v", len(batchList), err)
+	}
+	b := batchList[0]
+	rep, err := app.Report.Publish(report.PublishInput{BatchID: b.ID, Title: "初版报告", Conclusion: "结论A"})
+	if err != nil {
+		t.Fatalf("publish report: %v", err)
+	}
+	if _, err := app.Report.SignOff(rep.ID); err != nil {
+		t.Fatalf("sign off: %v", err)
+	}
+	// 发布时绑定的观察证据版本必须真实落盘，而非被丢弃为空。
+	published, err := app.Report.Get(rep.ID)
+	if err != nil {
+		t.Fatalf("get published report: %v", err)
+	}
+	if len(published.InputVersion.ObsFingerprints) == 0 {
+		t.Fatalf("published report did not bind observation evidence version")
+	}
+
+	// 发布后新增一条观察证据。
+	if _, err := app.Observation.Create(observationInputExtra(b.ID)); err != nil {
+		t.Fatalf("create extra observation: %v", err)
+	}
+	if _, err := app.Report.Revise(rep.ID, "修订报告", "结论B"); !errors.Is(err, model.ErrReportVersionDrift) {
+		t.Fatalf("expected ErrReportVersionDrift after adding observation, got %v", err)
+	}
+
+	// 旧报告仍处于已发布，未被替代（修订流程未把新证据混入）。
+	old, err := app.Report.Get(rep.ID)
+	if err != nil {
+		t.Fatalf("get old report: %v", err)
+	}
+	if old.Status != model.ReportPublished || old.SupersededBy != 0 {
+		t.Fatalf("old report should remain published: %+v", old)
+	}
+}
+
+// TestReviseStillWorksWhenNoObservationChange 验证发布与修订之间无观察变化时正常修订流程不变。
+func TestReviseStillWorksWhenNoObservationChange(t *testing.T) {
+	app := newReportAppWithConfirmedCandidate(t)
+	batchList, err := app.Batch.List(10, 0)
+	if err != nil || len(batchList) != 1 {
+		t.Fatalf("list batch: len=%d err=%v", len(batchList), err)
+	}
+	b := batchList[0]
+	rep, err := app.Report.Publish(report.PublishInput{BatchID: b.ID, Title: "初版报告", Conclusion: "结论A"})
+	if err != nil {
+		t.Fatalf("publish report: %v", err)
+	}
+	if _, err := app.Report.SignOff(rep.ID); err != nil {
+		t.Fatalf("sign off: %v", err)
+	}
+	revised, err := app.Report.Revise(rep.ID, "修订报告", "结论B")
+	if err != nil {
+		t.Fatalf("revise should succeed when no observation changed: %v", err)
+	}
+	if revised.InputVersion.BatchFingerprint != rep.InputVersion.BatchFingerprint {
+		t.Fatal("revision changed batch input fingerprint")
+	}
+	if !sameObsFingerprints(revised.InputVersion.ObsFingerprints, rep.InputVersion.ObsFingerprints) {
+		t.Fatal("revision changed observation evidence fingerprint")
+	}
+}
+
+func sameObsFingerprints(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func newReportAppWithConfirmedCandidate(t *testing.T) *service.App {
 	t.Helper()
 	app := newReportApp(t)
@@ -128,6 +212,14 @@ func phasediagramInput() phasediagram.CreateInput {
 func observationInput(batchID int64) observation.CreateInput {
 	return observation.CreateInput{
 		BatchID: batchID, Observer: "报告观察员", ImageRef: "report-image",
+		PhaseEstimate: map[string]float64{"austenite": 100},
+	}
+}
+
+// observationInputExtra 构造发布后新增的第二条观察证据（不同图像，确保指纹不同）。
+func observationInputExtra(batchID int64) observation.CreateInput {
+	return observation.CreateInput{
+		BatchID: batchID, Observer: "补充观察员", ImageRef: "report-image-extra",
 		PhaseEstimate: map[string]float64{"austenite": 100},
 	}
 }

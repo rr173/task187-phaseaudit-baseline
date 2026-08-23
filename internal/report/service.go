@@ -63,17 +63,10 @@ func (s *Service) Publish(in PublishInput) (*model.MicroReport, error) {
 		return nil, fmt.Errorf("没有已确认的相候选，无法发布报告")
 	}
 
-	obs, err := s.obs.ListByBatch(in.BatchID)
+	obsFps, err := s.activeObsFingerprints(in.BatchID)
 	if err != nil {
 		return nil, err
 	}
-	var obsFps []string
-	for _, o := range obs {
-		if o.Status != model.ObsExcluded {
-			obsFps = append(obsFps, o.Fingerprint)
-		}
-	}
-	obsFps = nil
 
 	// 相图版本：取已确认候选使用的相图。
 	var diagramID int64
@@ -156,7 +149,27 @@ func (s *Service) Revise(oldReportID int64, newTitle, newConclusion string) (*mo
 	return created, nil
 }
 
+// activeObsFingerprints 返回批次内当前有效（非排除）观察证据的指纹列表，
+// 顺序固定（按观察 ID）。发布快照与防漂移校验共用此口径，保证「绑定的输入版本」
+// 与「校验时的输入版本」可比。
+func (s *Service) activeObsFingerprints(batchID int64) ([]string, error) {
+	obs, err := s.obs.ListByBatch(batchID)
+	if err != nil {
+		return nil, err
+	}
+	var fps []string
+	for _, o := range obs {
+		if o.Status == model.ObsExcluded {
+			continue
+		}
+		fps = append(fps, o.Fingerprint)
+	}
+	return fps, nil
+}
+
 // VerifyNoDrift 校验报告输入版本与当前批次/观察/相图一致（防漂移守卫）。
+// 旧报告在发布时已绑定观察证据版本；若之后新增观察导致证据指纹集合变化，
+// 视为输入版本漂移——新证据应作为新轮次推断，而非混入旧报告的修订流程。
 func (s *Service) VerifyNoDrift(r *model.MicroReport) error {
 	b, err := s.batch.Get(r.BatchID)
 	if err != nil {
@@ -166,6 +179,13 @@ func (s *Service) VerifyNoDrift(r *model.MicroReport) error {
 		return model.ErrReportVersionDrift
 	}
 	if d, derr := s.diag.Get(r.InputVersion.DiagramID); derr == nil && d.VersionNo != r.InputVersion.DiagramVer {
+		return model.ErrReportVersionDrift
+	}
+	curObsFps, err := s.activeObsFingerprints(r.BatchID)
+	if err != nil {
+		return err
+	}
+	if !sameStrings(curObsFps, r.InputVersion.ObsFingerprints) {
 		return model.ErrReportVersionDrift
 	}
 	return nil
