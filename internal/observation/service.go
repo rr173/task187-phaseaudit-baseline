@@ -53,7 +53,7 @@ func (s *Service) Create(in CreateInput) (*model.Observation, error) {
 		return nil, fmt.Errorf("夹杂物等级必须在 0-5 之间")
 	}
 	if err := model.VerifyConservation(in.PhaseEstimate, 100); err != nil {
-		return nil, fmt.Errorf("观察相比例无效: %v", err)
+		return nil, fmt.Errorf("观察相比例无效: %w", err)
 	}
 	used, err := s.store.HasImageInOtherBatch(in.ImageRef, in.BatchID)
 	if err != nil {

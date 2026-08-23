@@ -101,8 +101,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		errors.Is(err, model.ErrReportVersionDrift), errors.Is(err, model.ErrReportSuperseded),
 		errors.Is(err, model.ErrDiagramNotPublished):
 		code = http.StatusConflict
-	case errors.Is(err, model.ErrFractionSumExceedsOne), errors.Is(err, model.ErrCompositionOutOfRange),
-		errors.Is(err, model.ErrCrossBatchImage):
+	case errors.Is(err, model.ErrNegativeFraction), errors.Is(err, model.ErrFractionSumExceedsOne),
+		errors.Is(err, model.ErrCompositionOutOfRange), errors.Is(err, model.ErrCrossBatchImage):
 		code = http.StatusBadRequest
 	}
 	writeJSON(w, code, map[string]string{"error": err.Error()})

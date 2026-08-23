@@ -230,7 +230,7 @@ func VerifyConservation(fractions map[string]float64, limit float64) error {
 	sum := 0.0
 	for phase, frac := range fractions {
 		if frac < 0 {
-			return errors.New(fmt.Sprintf("相比例不能为负: %s=%v", phase, frac))
+			return fmt.Errorf("%w: %s=%v", ErrNegativeFraction, phase, frac)
 		}
 		sum += frac
 	}
